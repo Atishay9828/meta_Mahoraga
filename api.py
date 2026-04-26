@@ -1,6 +1,6 @@
 """
 Mahoraga Adaptation Engine — FastAPI Bridge
-Wraps MahoragaEnv with REST endpoints for the React combat dashboard.
+Wraps MahoragaBossEnv with REST endpoints for the React combat dashboard.
 Includes LLM auto-play via trained Qwen 2.5 3B LoRA model.
 """
 import sys
@@ -12,18 +12,18 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Dict, Any
 
-from env.mahoraga_env import MahoragaEnv
-from utils.constants import MAX_HP, ENEMY_HP, MAX_TURNS
+from env.mahoraga_boss_env import MahoragaBossEnv
 
 # ── Action lookup ──
 ACTION_NAMES = {
-    0: "Adapt PHYSICAL",
-    1: "Adapt CE",
-    2: "Adapt TECHNIQUE",
-    3: "Judgment Strike",
-    4: "Regeneration",
+    0: "Physical Attack",
+    1: "CE Attack",
+    2: "CT Attack",
+    3: "Domain Expansion",
+    4: "Heal",
+    5: "Binding Vow",
     None: "Wasted Turn",
 }
 
@@ -38,7 +38,7 @@ app.add_middleware(
 )
 
 # ── Global state ──
-env: Optional[MahoragaEnv] = None
+env: Optional[MahoragaBossEnv] = None
 current_difficulty: str = "hard"
 
 # ── LLM Model (lazy loaded) ──
@@ -66,8 +66,6 @@ def load_llm():
 
     try:
         print("[LLM] Loading Qwen 2.5 3B + LoRA (4-bit)... This may take 30-60s.")
-
-        # Try unsloth first (faster), fall back to transformers+peft
         try:
             from unsloth import FastLanguageModel
             import torch
@@ -80,7 +78,6 @@ def load_llm():
             )
             FastLanguageModel.for_inference(llm_model)
             print("[LLM] Model loaded via Unsloth.")
-
         except ImportError:
             print("[LLM] Unsloth not found, using transformers + peft...")
             import torch
@@ -117,39 +114,30 @@ def load_llm():
 
 def build_prompt(state_dict):
     """Build instruction prompt from environment state."""
-    res = state_dict["resistances"]
-    return f"""You are Mahoraga, an adaptive combat agent in a turn-based RL environment.
+    return f"""You are a combat agent facing Mahoraga.
 
 Current State:
-- Your HP: {state_dict['agent_hp']}
-- Enemy HP: {state_dict['enemy_hp']}
-- Resistances: Physical={res['physical']}, CE={res['ce']}, Technique={res['technique']}
-- Last Enemy Attack: {state_dict['last_enemy_attack_type']}
-- Last Action Taken: {state_dict['last_action']}
-- Turn: {state_dict['turn_number']}
+- Your HP: {state_dict['player_hp'][0]}
+- Mahoraga HP: {state_dict['boss_hp'][0]}
+- Boss Resistances: Physical={state_dict['res_physical'][0]}, CE={state_dict['res_ce'][0]}, Technique={state_dict['res_ct'][0]}
 
 Available Actions:
-0 = Adapt Physical Resistance (+40 Physical, -20 others)
-1 = Adapt CE Resistance (+40 CE, -20 others)
-2 = Adapt Technique Resistance (+40 Technique, -20 others)
-3 = Judgment Strike (burst if you adapted to enemy's type, resets resistances)
-4 = Regeneration (heal 300 HP, 3-turn cooldown)
+0 = Physical Attack
+1 = CE Attack
+2 = CT Attack
+3 = Domain Expansion
+4 = Heal
+5 = Binding Vow
 
-WINNING STRATEGY:
-1. Adapt to enemy attack type 2 times to build resistance + stacks
-2. Use Judgment Strike for burst damage (350 + 50 per stack)
-3. Repeat: Adapt → Adapt → Strike
-4. Heal ONLY when HP is critically low
-
-Choose the best action. Return ONLY a single integer (0-4)."""
+Choose the best action. Return ONLY a single integer (0-5)."""
 
 
 def parse_action(text):
-    """Extract integer action 0-4 from model output."""
+    """Extract integer action 0-5 from model output."""
     text = text.strip()
-    if text in ['0', '1', '2', '3', '4']:
+    if text in ['0', '1', '2', '3', '4', '5']:
         return int(text)
-    match = re.search(r'[0-4]', text)
+    match = re.search(r'[0-5]', text)
     if match:
         return int(match.group())
     return 0
@@ -161,7 +149,7 @@ def llm_choose_action(state_dict):
 
     prompt = build_prompt(state_dict)
     messages = [
-        {"role": "system", "content": "You are a combat AI. Respond with ONLY a single integer 0-4."},
+        {"role": "system", "content": "You are a combat AI. Respond with ONLY a single integer 0-5."},
         {"role": "user", "content": prompt}
     ]
 
@@ -183,71 +171,40 @@ def llm_choose_action(state_dict):
 
 
 # ── Response schemas ──
-class TurnLog(BaseModel):
-    turn: int
-    enemy_attack_type: str
-    enemy_subtype: str
-    mahoraga_action: str
-    damage_taken: int
-    damage_dealt: int
-    correct_adaptation: bool
-    reward: float
-    heal_blocked: bool
+class DomainState(BaseModel):
+    active: bool
+    turns_left: int
 
+class Cooldowns(BaseModel):
+    heal: int
+    turns_since_last_DE: int
 
 class Resistances(BaseModel):
-    Physical: int
-    CE: int
-    Technique: int
-
+    physical: float
+    ce: float
+    ct: float
 
 class CombatState(BaseModel):
-    enemy_hp: int
-    enemy_hp_max: int
-    mahoraga_hp: int
-    mahoraga_hp_max: int
+    player_hp: float
+    boss_hp: float
     resistances: Resistances
-    adaptation_stack: int
-    heal_cooldown: int
+    domain: DomainState
+    cooldowns: Cooldowns
+    crit_stack: int
+    log: str
+    done: bool
     turn_number: int
     max_turns: int
-    done: bool
-    done_reason: Optional[str] = None
-    turn_log: Optional[TurnLog] = None
     difficulty: str = "hard"
     llm_raw: Optional[str] = None
 
 
 class StepRequest(BaseModel):
-    action: int  # 0-4
+    action: int  # 0-5
 
 
 class ResetRequest(BaseModel):
     difficulty: str = "hard"
-
-
-# ── Helper ──
-def make_combat_state(state, env_instance, turn_log=None, llm_raw=None):
-    return CombatState(
-        enemy_hp=state["enemy_hp"],
-        enemy_hp_max=ENEMY_HP,
-        mahoraga_hp=state["agent_hp"],
-        mahoraga_hp_max=MAX_HP,
-        resistances=Resistances(
-            Physical=state["resistances"]["physical"],
-            CE=state["resistances"]["ce"],
-            Technique=state["resistances"]["technique"],
-        ),
-        adaptation_stack=env_instance.adaptation_stack if hasattr(env_instance, 'adaptation_stack') else 0,
-        heal_cooldown=env_instance.heal_cooldown_counter,
-        turn_number=state["turn_number"],
-        max_turns=MAX_TURNS,
-        done=False,
-        done_reason=None,
-        turn_log=turn_log,
-        difficulty=current_difficulty,
-        llm_raw=llm_raw,
-    )
 
 
 # ── Endpoints ──
@@ -257,65 +214,62 @@ def reset(req: ResetRequest = ResetRequest()):
     """Reset the environment to initial state with specified difficulty."""
     global env, current_difficulty
     current_difficulty = req.difficulty
-    env = MahoragaEnv(difficulty=current_difficulty)
-    env.reset()
+    env = MahoragaBossEnv()
+    state, _ = env.reset()
 
     return CombatState(
-        enemy_hp=ENEMY_HP,
-        enemy_hp_max=ENEMY_HP,
-        mahoraga_hp=MAX_HP,
-        mahoraga_hp_max=MAX_HP,
-        resistances=Resistances(Physical=0, CE=0, Technique=0),
-        adaptation_stack=0,
-        heal_cooldown=0,
-        turn_number=0,
-        max_turns=MAX_TURNS,
+        player_hp=float(state["player_hp"][0]),
+        boss_hp=float(state["boss_hp"][0]),
+        resistances=Resistances(physical=0, ce=0, ct=0),
+        domain=DomainState(active=False, turns_left=0),
+        cooldowns=Cooldowns(heal=0, turns_since_last_DE=4),
+        crit_stack=0,
+        log="Combat initialized. Engage Mahoraga.",
         done=False,
-        done_reason=None,
-        turn_log=None,
+        turn_number=0,
+        max_turns=30,
         difficulty=current_difficulty,
     )
 
 
 def _do_step(action, llm_raw=None):
-    """Execute one turn of combat (shared by manual step and auto-step)."""
+    """Execute one turn of combat."""
     global env
     if env is None:
-        env = MahoragaEnv(difficulty=current_difficulty)
+        env = MahoragaBossEnv()
         env.reset()
 
-    state, reward, done, info = env.step(action)
-    action_name = ACTION_NAMES.get(env.last_action, "Unknown")
-
-    turn_log = TurnLog(
-        turn=state["turn_number"],
-        enemy_attack_type=state["last_enemy_attack_type"] or "NONE",
-        enemy_subtype=state["last_enemy_subtype"] or "NONE",
-        mahoraga_action=action_name,
-        damage_taken=info["damage_taken"],
-        damage_dealt=info["damage_dealt"],
-        correct_adaptation=info["correct_adaptation"],
-        reward=round(reward, 2),
-        heal_blocked=info.get("heal_on_cooldown", False),
-    )
+    state, reward, done, _, info = env.step(action)
+    action_name = ACTION_NAMES.get(action, "Unknown Action")
+    
+    # Constructing a dynamic log message
+    log_msg = f"Player used {action_name}. Dealt {info['damage_dealt']:.0f} DMG. Mahoraga dealt {info['damage_taken']:.0f} DMG."
+    if info.get("win"):
+        log_msg = "Mahoraga has been defeated! You win."
+    elif info.get("loss"):
+        log_msg = "Player has fallen. You lose."
 
     return CombatState(
-        enemy_hp=state["enemy_hp"],
-        enemy_hp_max=ENEMY_HP,
-        mahoraga_hp=state["agent_hp"],
-        mahoraga_hp_max=MAX_HP,
+        player_hp=float(state["player_hp"][0]),
+        boss_hp=float(state["boss_hp"][0]),
         resistances=Resistances(
-            Physical=state["resistances"]["physical"],
-            CE=state["resistances"]["ce"],
-            Technique=state["resistances"]["technique"],
+            physical=float(state["res_physical"][0]),
+            ce=float(state["res_ce"][0]),
+            ct=float(state["res_ct"][0]),
         ),
-        adaptation_stack=info["adaptation_stack"],
-        heal_cooldown=env.heal_cooldown_counter,
-        turn_number=state["turn_number"],
-        max_turns=MAX_TURNS,
+        domain=DomainState(
+            active=bool(state["DE_active"]),
+            turns_left=int(state["DE_turns_left"])
+        ),
+        cooldowns=Cooldowns(
+            heal=int(state["heal_cooldown"]),
+            turns_since_last_DE=int(state["turns_since_last_DE"])
+        ),
+        crit_stack=int(state["crit_stack"]),
+        log=log_msg,
         done=done,
-        done_reason=info.get("reason"),
-        turn_log=turn_log,
+        turn_number=int(info["turn"]),
+        max_turns=30,
         difficulty=current_difficulty,
         llm_raw=llm_raw,
     )
@@ -332,18 +286,20 @@ def auto_step():
     """Execute one turn using the trained LLM to choose the action."""
     global env
     if env is None:
-        env = MahoragaEnv(difficulty=current_difficulty)
+        env = MahoragaBossEnv()
         env.reset()
 
-    # Load model on first call
     if not llm_loaded and not load_llm():
-        # Fallback to smart rule-based agent
+        # Fallback to rule-based agent
         action = _smart_agent_action()
         return _do_step(action, llm_raw="[FALLBACK] rule-based")
 
-    # Get LLM's state observation
-    state_dict = env._get_state()
-    action, raw_output = llm_choose_action(state_dict)
+    # The wrapper's state is returned directly
+    state, _ = env.logic.get_state() if hasattr(env, 'logic') else (env._format_state(env.logic.get_state()), None)
+    if isinstance(state, tuple):
+        state = state[0]
+        
+    action, raw_output = llm_choose_action(env.logic.get_state())
     return _do_step(action, llm_raw=raw_output)
 
 
@@ -362,29 +318,23 @@ def _smart_agent_action():
     if env is None:
         return 0
 
-    state = env._get_state()
-    agent_hp = state["agent_hp"]
-    res = state["resistances"]
+    state = env.logic.get_state()
+    player_hp = state["player_hp"]
 
-    # Heal if critical HP and cooldown ready
-    if agent_hp < 300 and env.heal_cooldown_counter == 0:
+    if player_hp < 400 and state["heal_cooldown"] == 0:
         return 4
-
-    # Judgment Strike if stacks >= 3 (or >= 2 and adapted to right type)
-    if env.adaptation_stack >= 3:
+        
+    if state["turns_since_last_DE"] >= 4 and player_hp < 800:
         return 3
-    if env.adaptation_stack >= 2 and env.last_adapted_category == state.get("last_enemy_attack_type"):
-        return 3
-
-    # Adapt to last enemy attack type
-    last_attack = state.get("last_enemy_attack_type")
-    adapt_map = {"PHYSICAL": 0, "CE": 1, "TECHNIQUE": 2}
-    if last_attack and last_attack in adapt_map:
-        return adapt_map[last_attack]
-
-    # Default: adapt to weakest resistance
+        
+    # Attack with lowest resistance
+    res = {
+        0: state["res_physical"],
+        1: state["res_ce"],
+        2: state["res_ct"]
+    }
     weakest = min(res, key=res.get)
-    return adapt_map.get(weakest.upper(), 0)
+    return weakest
 
 
 if __name__ == "__main__":
