@@ -1,22 +1,3 @@
----
-title: "Project Mahoraga - Adaptive Combat RL Environment"
-emoji: "⚔️"
-colorFrom: red
-colorTo: gray
-sdk: docker
-app_file: app.py
-app_port: 7860
-pinned: false
-tags:
-  - reinforcement-learning
-  - adaptive-agent
-  - reward-engineering
-  - llm-agent
-  - qwen
-  - lora
-  - fastapi
-  - react
----
 
 # Project Mahoraga
 
