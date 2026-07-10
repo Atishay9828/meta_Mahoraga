@@ -445,5 +445,5 @@ Mahoraga is best understood as an environment and reward-design experiment, not 
 
 ## Author
 
-Built by **Atishay Jain** for the Meta OpenEnv Hackathon 2026.
+Built by **Atishay Jain** and **Mridul Negi**for the Meta OpenEnv Hackathon 2026.
 
